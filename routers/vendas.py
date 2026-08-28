@@ -7,7 +7,6 @@ from cache import get_dados
 from datetime import datetime, timedelta
 
 from security import get_api_key
-from database import executar_procedure
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
