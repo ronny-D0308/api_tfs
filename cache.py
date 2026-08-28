@@ -6,7 +6,7 @@ from functools import partial
 from supabase_client import executar_procedure
 logger = logging.getLogger(__name__)
 
-PROCEDURE = "P_RCS_REPORT_PROJECAO_2026"
+PROCEDURE = "vendas"
 CACHE_TTL = timedelta(hours=2)
 
 _store = {"data": None, "timestamp": None, "loading": False}
