@@ -91,18 +91,20 @@ def executar_procedure(tabela: str = "vendas", cliente_id: str = None) -> list[d
         "select": "*",
     }
 
-    def buscar_pagina(offset: int):
+    def buscar_pagina(offset: int, pedir_total: bool = False):
         headers = {
             **headers_base,
             "Range-Unit": "items",
             "Range": f"{offset}-{offset + tamanho_pagina - 1}",
         }
+        if pedir_total:
+            headers["Prefer"] = "count=exact"
         resp = requests.get(url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
         return offset, resp.json(), resp.headers.get("Content-Range")
 
-    # --- 1ª página: também nos diz o total de linhas (Content-Range: 0-999/228033) ---
-    primeiro_offset, primeira_pagina, content_range = buscar_pagina(0)
+    # --- 1ª página: pede o total exato via "Prefer: count=exact" ---
+    primeiro_offset, primeira_pagina, content_range = buscar_pagina(0, pedir_total=True)
     todos_registros = list(primeira_pagina)
 
     total = None
@@ -110,12 +112,23 @@ def executar_procedure(tabela: str = "vendas", cliente_id: str = None) -> list[d
         try:
             total = int(content_range.split("/")[-1])
         except ValueError:
-            total = None
+            total = None  # veio "*" — total desconhecido
 
-    # Se não sabemos o total, ou a primeira página já veio incompleta, paramos aqui.
-    if total is None or len(primeira_pagina) < tamanho_pagina:
-        pagina_convertida = [_converter_para_formato_original(r, tabela) for r in todos_registros]
-        return pagina_convertida
+    # Primeira página já veio incompleta: é a última mesmo, não precisa de mais nada.
+    if len(primeira_pagina) < tamanho_pagina:
+        return [_converter_para_formato_original(r, tabela) for r in todos_registros]
+
+    # Caso o total não venha (situação inesperada), cai para paginação sequencial seguro,
+    # em vez de arriscar retornar dados incompletos silenciosamente.
+    if total is None:
+        offset = tamanho_pagina
+        while True:
+            _, pagina, _ = buscar_pagina(offset)
+            todos_registros.extend(pagina)
+            if len(pagina) < tamanho_pagina:
+                break
+            offset += tamanho_pagina
+        return [_converter_para_formato_original(r, tabela) for r in todos_registros]
 
     # --- Páginas restantes, em paralelo ---
     offsets_restantes = list(range(tamanho_pagina, total, tamanho_pagina))
