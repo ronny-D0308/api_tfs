@@ -8,6 +8,7 @@ os routers não precisem de nenhuma outra alteração.
 
 import os
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -71,43 +72,66 @@ def _converter_para_formato_original(registro: dict, tabela: str) -> dict:
 def executar_procedure(tabela: str = "vendas", cliente_id: str = None) -> list[dict]:
     """
     Busca todos os registros da tabela no Supabase para o cliente configurado.
-    Usa paginação automática, pois o PostgREST limita ~1000 linhas por requisição.
+
+    Primeiro descobre o total de linhas (via header Content-Range) e depois
+    busca todas as páginas EM PARALELO, em vez de uma por vez — isso reduz
+    drasticamente o tempo total para tabelas grandes (ex: 228k linhas).
     """
     cliente_id = cliente_id or CLIENTE_ID
+    tamanho_pagina = 1000
+    max_workers = 10  # nº de requisições simultâneas ao Supabase
 
-    headers = {
+    headers_base = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     }
-
     url = f"{SUPABASE_URL}/rest/v1/{tabela}"
     params = {
         "cliente_id": f"eq.{cliente_id}",
         "select": "*",
     }
 
-    todos_registros = []
-    offset = 0
-    tamanho_pagina = 1000
-
-    while True:
-        headers_paginacao = {
-            **headers,
+    def buscar_pagina(offset: int):
+        headers = {
+            **headers_base,
             "Range-Unit": "items",
             "Range": f"{offset}-{offset + tamanho_pagina - 1}",
         }
-        resp = requests.get(url, headers=headers_paginacao, params=params, timeout=30)
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
+        return offset, resp.json(), resp.headers.get("Content-Range")
 
-        pagina = resp.json()
-        pagina_convertida = [_converter_para_formato_original(r, tabela) for r in pagina]
-        todos_registros.extend(pagina_convertida)
+    # --- 1ª página: também nos diz o total de linhas (Content-Range: 0-999/228033) ---
+    primeiro_offset, primeira_pagina, content_range = buscar_pagina(0)
+    todos_registros = list(primeira_pagina)
 
-        if len(pagina) < tamanho_pagina:
-            break  # última página
-        offset += tamanho_pagina
+    total = None
+    if content_range and "/" in content_range:
+        try:
+            total = int(content_range.split("/")[-1])
+        except ValueError:
+            total = None
 
-    return todos_registros
+    # Se não sabemos o total, ou a primeira página já veio incompleta, paramos aqui.
+    if total is None or len(primeira_pagina) < tamanho_pagina:
+        pagina_convertida = [_converter_para_formato_original(r, tabela) for r in todos_registros]
+        return pagina_convertida
+
+    # --- Páginas restantes, em paralelo ---
+    offsets_restantes = list(range(tamanho_pagina, total, tamanho_pagina))
+    resultados_por_offset = {}
+
+    if offsets_restantes:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futuros = {executor.submit(buscar_pagina, off): off for off in offsets_restantes}
+            for futuro in as_completed(futuros):
+                offset, pagina, _ = futuro.result()
+                resultados_por_offset[offset] = pagina
+
+    for offset in offsets_restantes:
+        todos_registros.extend(resultados_por_offset.get(offset, []))
+
+    return [_converter_para_formato_original(r, tabela) for r in todos_registros]
 
 
 def executar_query(tabela_ou_sql: str, params=None) -> list[dict]:
